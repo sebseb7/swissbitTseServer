@@ -12,6 +12,16 @@ int db_open(const char *path);
 void db_close(void);
 int db_init_schema(void);
 
+/*
+ * Requests are handled concurrently, so every access to g_db must be
+ * serialised. SQLite's own locking protects the connection, but not the
+ * read-modify-write sequences this code builds on top of it (counter
+ * increments, "check state then update"). The mutex is recursive so that a
+ * store_* function may hold it across the db_* helpers it calls.
+ */
+void db_lock(void);
+void db_unlock(void);
+
 char *db_get_setting(const char *key, char *buf, size_t buflen);
 int db_set_setting(const char *key, const char *value);
 int64_t db_increment_counter(const char *key);

@@ -4,6 +4,12 @@ CFLAGS  ?= -Wall -Wextra -O2 -std=c11 -Iinclude -D_POSIX_C_SOURCE=200809L -D_DEF
 CFLAGS  += -MMD -MP
 LDFLAGS ?= -lsqlite3 -ldl -lpthread -lcrypto
 
+# libuv drives the HTTP event loop. Prefer pkg-config, fall back to a plain -luv.
+UV_CFLAGS  := $(shell pkg-config --cflags libuv 2>/dev/null)
+UV_LDFLAGS := $(shell pkg-config --libs libuv 2>/dev/null || echo -luv)
+CFLAGS  += $(UV_CFLAGS)
+LDFLAGS += $(UV_LDFLAGS)
+
 SRCS = src/main.c \
        src/config.c \
        src/db.c \

@@ -2,52 +2,52 @@
 
 #include "config.h"
 #include "handlers.h"
+#include "log.h"
 #include "util.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <uv.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
 
+/* Idle time a keep-alive connection may sit without sending a request. */
 #define HTTP_CLIENT_TIMEOUT_SEC 30
+/* Upper bound on how long a single response write may stall. */
+#define HTTP_WRITE_TIMEOUT_MS 10000
+#define HTTP_LISTEN_BACKLOG 128
 
 static volatile sig_atomic_t *s_running = NULL;
-static int s_listen_fd = -1;
 
-static int select_wait(int fd, int write_fd, int timeout_ms) {
-    fd_set rfds;
+static int wait_writable(int fd, int timeout_ms) {
     fd_set wfds;
-    FD_ZERO(&rfds);
     FD_ZERO(&wfds);
-    if (write_fd) {
-        FD_SET(fd, &wfds);
-    } else {
-        FD_SET(fd, &rfds);
-    }
+    FD_SET(fd, &wfds);
 
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (suseconds_t)(timeout_ms % 1000) * 1000;
 
-    return select(fd + 1, write_fd ? NULL : &rfds, write_fd ? &wfds : NULL, NULL, &tv);
+    return select(fd + 1, NULL, &wfds, NULL, &tv);
 }
 
-static void configure_client_socket(int fd) {
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-}
-
+/*
+ * Responses are written straight to the socket from the thread handling the
+ * request, which keeps the streaming export (an arbitrarily large body) simple.
+ * The event loop has stopped reading the connection for the duration, so it
+ * never touches the fd concurrently. libuv sockets are non-blocking, hence the
+ * explicit wait-then-send loop.
+ */
 int http_write_all(int fd, const void *data, size_t len) {
     const char *p = data;
     size_t left = len;
@@ -56,12 +56,15 @@ int http_write_all(int fd, const void *data, size_t len) {
         if (s_running && !*s_running) {
             return -1;
         }
-        if (select_wait(fd, 1, 10000) <= 0) {
-            return -1;
-        }
         ssize_t n = send(fd, p, left, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (wait_writable(fd, HTTP_WRITE_TIMEOUT_MS) <= 0) {
+                    return -1;
+                }
                 continue;
             }
             return -1;
@@ -70,24 +73,6 @@ int http_write_all(int fd, const void *data, size_t len) {
         left -= (size_t)n;
     }
     return 0;
-}
-
-static void drain_client(int fd) {
-    char discard[512];
-    struct timeval tv = {0, 250000};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    for (;;) {
-        ssize_t n = read(fd, discard, sizeof(discard));
-        if (n <= 0) {
-            break;
-        }
-    }
-}
-
-static void close_client(int fd) {
-    shutdown(fd, SHUT_WR);
-    drain_client(fd);
-    close(fd);
 }
 
 static const char *find_header_end(const char *buf, size_t total) {
@@ -166,33 +151,6 @@ static int request_complete(const char *buf, size_t total, size_t *msg_len) {
 
     *msg_len = hdr_len + content_len;
     return total >= *msg_len;
-}
-
-static int fill_buffer(int client_fd, char *buf, size_t *total, size_t buflen) {
-    while (*total < buflen - 1) {
-        if (s_running && !*s_running) {
-            return -1;
-        }
-        if (select_wait(client_fd, 0, HTTP_CLIENT_TIMEOUT_SEC * 1000) <= 0) {
-            return -1;
-        }
-
-        ssize_t n = read(client_fd, buf + *total, buflen - 1 - *total);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
-            return (*total > 0) ? 0 : -1;
-        }
-
-        *total += (size_t)n;
-        buf[*total] = '\0';
-        return 0;
-    }
-    return -1;
 }
 
 static int should_keep_alive(const http_request_t *req) {
@@ -519,133 +477,373 @@ void http_send_json(int client_fd, int status, const char *json) {
     http_send_response(client_fd, &res, 0);
 }
 
-static void handle_client(int client_fd) {
-    char buf[HTTP_MAX_BODY + 16384];
-    size_t total = 0;
-    int keep_alive = 1;
+/*
+ * ── Connection handling ────────────────────────────────────────────────────
+ *
+ * A libuv event loop owns every socket. Accepting, reading and the idle
+ * timeout all happen on the loop thread and never block, so any number of
+ * clients can be connected at once. As soon as a full request has arrived the
+ * connection is handed to the libuv thread pool, because handlers block: they
+ * hit SQLite and, in hardware mode, wait on the serialised WORM worker for
+ * seconds at a time. The loop thread stays free to serve everyone else while
+ * that happens.
+ *
+ * Reading is stopped while a request is in flight, so one connection never has
+ * more than one outstanding job and requests on a connection stay ordered.
+ */
 
-    while (keep_alive) {
-        size_t msg_len = 0;
+#define CONN_READ_CHUNK 8192
+#define CONN_MAX_BUFFER (HTTP_MAX_BODY + 16384)
 
-        while (!request_complete(buf, total, &msg_len)) {
-            if (total >= sizeof(buf) - 1) {
-                close_client(client_fd);
+typedef struct {
+    uv_tcp_t   handle;
+    uv_timer_t idle;
+    uv_work_t  work;
+
+    char  *buf;
+    size_t len;
+    size_t cap;
+    size_t msg_len;
+
+    http_request_t  *req;
+    http_response_t *res;
+
+    int fd;
+    int keep_alive;
+    int bad_request;
+    int processing; /* a thread-pool job owns the fd right now */
+    int closing;    /* close requested; deferred while processing */
+    int closed;
+    int handles_open;
+} conn_t;
+
+static uv_loop_t  s_loop;
+static uv_tcp_t   s_server;
+static uv_async_t s_stop_async;
+static int        s_loop_ready = 0;
+
+static void conn_start_reading(conn_t *c);
+
+static void on_handle_closed(uv_handle_t *handle) {
+    conn_t *c = handle->data;
+    if (--c->handles_open > 0) {
+        return;
+    }
+    free(c->buf);
+    free(c->req);
+    free(c->res);
+    free(c);
+}
+
+static void conn_close(conn_t *c) {
+    c->closing = 1;
+    if (c->closed) {
+        return;
+    }
+    /*
+     * Closing the handle closes the fd, and a thread-pool job may still be
+     * writing the response to it. Let after_work_cb finish the close instead.
+     */
+    if (c->processing) {
+        return;
+    }
+    c->closed = 1;
+    uv_timer_stop(&c->idle);
+    if (!uv_is_closing((uv_handle_t *)&c->idle)) {
+        uv_close((uv_handle_t *)&c->idle, on_handle_closed);
+    }
+    if (!uv_is_closing((uv_handle_t *)&c->handle)) {
+        uv_read_stop((uv_stream_t *)&c->handle);
+        uv_close((uv_handle_t *)&c->handle, on_handle_closed);
+    }
+}
+
+static void on_idle_timeout(uv_timer_t *timer) {
+    conn_close(timer->data);
+}
+
+static void alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
+    (void)suggested;
+    conn_t *c = handle->data;
+
+    if (c->len + CONN_READ_CHUNK + 1 > c->cap) {
+        size_t want = c->cap ? c->cap * 2 : CONN_READ_CHUNK * 2;
+        while (want < c->len + CONN_READ_CHUNK + 1) {
+            want *= 2;
+        }
+        if (want > CONN_MAX_BUFFER) {
+            want = CONN_MAX_BUFFER;
+        }
+        if (want > c->cap) {
+            char *grown = realloc(c->buf, want);
+            if (!grown) {
+                buf->base = NULL;
+                buf->len = 0;
                 return;
             }
-            if (fill_buffer(client_fd, buf, &total, sizeof(buf)) != 0) {
-                close_client(client_fd);
-                return;
-            }
+            c->buf = grown;
+            c->cap = want;
         }
-
-        char req_raw[HTTP_MAX_BODY + 8192];
-        if (msg_len >= sizeof(req_raw)) {
-            msg_len = sizeof(req_raw) - 1;
-        }
-        memcpy(req_raw, buf, msg_len);
-        if (total > msg_len) {
-            memmove(buf, buf + msg_len, total - msg_len);
-        }
-        total -= msg_len;
-
-        http_request_t req;
-        if (http_parse_request(req_raw, msg_len, &req) != 0) {
-            http_send_json(client_fd, 400,
-                           "{\"error\":\"bad_request\",\"message\":\"Invalid HTTP request\"}");
-            close_client(client_fd);
-            return;
-        }
-
-        const char *ct = http_get_header(&req, "Content-Type");
-        char parsed_body[HTTP_MAX_BODY];
-        http_parse_body(req.body, req.body_len, ct ? ct : "", parsed_body, sizeof(parsed_body));
-        if (parsed_body[0]) {
-            util_strlcpy(req.body, parsed_body, sizeof(req.body));
-            req.body_len = strlen(req.body);
-        }
-
-        http_response_t res;
-        handlers_route(&req, &res);
-        keep_alive = should_keep_alive(&req);
-        http_send_response(client_fd, &res, keep_alive);
     }
 
-    close_client(client_fd);
+    size_t space = (c->cap > c->len + 1) ? c->cap - c->len - 1 : 0;
+    buf->base = c->buf + c->len;
+    buf->len = space;
+}
+
+/* Runs on a thread-pool thread: route the request and write the response. */
+static void work_cb(uv_work_t *work) {
+    conn_t *c = work->data;
+
+    if (c->bad_request) {
+        http_send_json(c->fd, 400,
+                       "{\"error\":\"bad_request\",\"message\":\"Invalid HTTP request\"}");
+        c->keep_alive = 0;
+        return;
+    }
+
+    if (http_parse_request(c->buf, c->msg_len, c->req) != 0) {
+        http_send_json(c->fd, 400,
+                       "{\"error\":\"bad_request\",\"message\":\"Invalid HTTP request\"}");
+        c->keep_alive = 0;
+        return;
+    }
+
+    const char *ct = http_get_header(c->req, "Content-Type");
+    char *parsed_body = malloc(HTTP_MAX_BODY);
+    if (parsed_body) {
+        http_parse_body(c->req->body, c->req->body_len, ct ? ct : "", parsed_body, HTTP_MAX_BODY);
+        if (parsed_body[0]) {
+            util_strlcpy(c->req->body, parsed_body, sizeof(c->req->body));
+            c->req->body_len = strlen(c->req->body);
+        }
+        free(parsed_body);
+    }
+
+    handlers_route(c->req, c->res);
+    c->keep_alive = should_keep_alive(c->req);
+    /* Streamed bodies have no Content-Length, so the close delimits them. */
+    if (c->res->stream) {
+        c->keep_alive = 0;
+    }
+    http_send_response(c->fd, c->res, c->keep_alive);
+}
+
+static void after_work_cb(uv_work_t *work, int status) {
+    conn_t *c = work->data;
+    c->processing = 0;
+
+    if (status == UV_ECANCELED || c->closing || !c->keep_alive || (s_running && !*s_running)) {
+        conn_close(c);
+        return;
+    }
+
+    /* Carry over anything the client pipelined behind this request. */
+    if (c->len > c->msg_len) {
+        memmove(c->buf, c->buf + c->msg_len, c->len - c->msg_len);
+        c->len -= c->msg_len;
+    } else {
+        c->len = 0;
+    }
+    c->msg_len = 0;
+
+    conn_start_reading(c);
+}
+
+static void dispatch_request(conn_t *c) {
+    uv_read_stop((uv_stream_t *)&c->handle);
+    uv_timer_stop(&c->idle);
+
+    if (uv_fileno((uv_handle_t *)&c->handle, &c->fd) != 0) {
+        conn_close(c);
+        return;
+    }
+
+    if (!c->req) {
+        c->req = malloc(sizeof(*c->req));
+    }
+    if (!c->res) {
+        c->res = malloc(sizeof(*c->res));
+    }
+    if (!c->req || !c->res) {
+        conn_close(c);
+        return;
+    }
+    memset(c->res, 0, sizeof(*c->res));
+
+    c->work.data = c;
+    c->processing = 1;
+    if (uv_queue_work(&s_loop, &c->work, work_cb, after_work_cb) != 0) {
+        c->processing = 0;
+        conn_close(c);
+    }
+}
+
+static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    (void)buf;
+    conn_t *c = stream->data;
+
+    if (nread < 0) {
+        conn_close(c);
+        return;
+    }
+    if (nread == 0) {
+        return;
+    }
+
+    c->len += (size_t)nread;
+    c->buf[c->len] = '\0';
+
+    size_t msg_len = 0;
+    if (request_complete(c->buf, c->len, &msg_len)) {
+        c->msg_len = msg_len;
+        dispatch_request(c);
+        return;
+    }
+
+    if (c->len + 1 >= CONN_MAX_BUFFER) {
+        c->bad_request = 1;
+        dispatch_request(c);
+    }
+}
+
+static void conn_start_reading(conn_t *c) {
+    if (c->closing) {
+        return;
+    }
+
+    /* A pipelined request may already be sitting in the buffer. */
+    size_t msg_len = 0;
+    if (c->len > 0 && request_complete(c->buf, c->len, &msg_len)) {
+        c->msg_len = msg_len;
+        dispatch_request(c);
+        return;
+    }
+
+    uv_timer_start(&c->idle, on_idle_timeout, HTTP_CLIENT_TIMEOUT_SEC * 1000, 0);
+    if (uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read) != 0) {
+        conn_close(c);
+    }
+}
+
+static void on_connection(uv_stream_t *server, int status) {
+    if (status != 0) {
+        log_error("accept: %s", uv_strerror(status));
+        return;
+    }
+
+    conn_t *c = calloc(1, sizeof(*c));
+    if (!c) {
+        return;
+    }
+    c->keep_alive = 1;
+    c->fd = -1;
+
+    if (uv_tcp_init(&s_loop, &c->handle) != 0) {
+        free(c);
+        return;
+    }
+    c->handle.data = c;
+    c->handles_open = 1;
+
+    if (uv_accept(server, (uv_stream_t *)&c->handle) != 0) {
+        uv_close((uv_handle_t *)&c->handle, on_handle_closed);
+        return;
+    }
+
+    uv_tcp_nodelay(&c->handle, 1);
+    uv_timer_init(&s_loop, &c->idle);
+    c->idle.data = c;
+    c->handles_open = 2;
+
+    conn_start_reading(c);
+}
+
+/* ── Shutdown ──────────────────────────────────────────────────────────── */
+
+static void close_walk_cb(uv_handle_t *handle, void *arg) {
+    (void)arg;
+    if (uv_is_closing(handle)) {
+        return;
+    }
+    if (handle == (uv_handle_t *)&s_server || handle == (uv_handle_t *)&s_stop_async) {
+        uv_close(handle, NULL);
+        return;
+    }
+    if (handle->data) {
+        conn_close(handle->data);
+    }
+}
+
+static void on_stop_async(uv_async_t *async) {
+    (void)async;
+    uv_walk(&s_loop, close_walk_cb, NULL);
 }
 
 void http_shutdown(void) {
-    if (s_listen_fd >= 0) {
-        close(s_listen_fd);
-        s_listen_fd = -1;
+    /* Called from a signal handler; uv_async_send is async-signal-safe. */
+    if (s_loop_ready) {
+        uv_async_send(&s_stop_async);
     }
 }
 
 int http_serve(const char *host, uint16_t port, volatile sig_atomic_t *running) {
     s_running = running;
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket");
+    if (uv_loop_init(&s_loop) != 0) {
+        log_error("uv_loop_init failed");
         return -1;
     }
-
-    s_listen_fd = server_fd;
-
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
-        addr.sin_addr.s_addr = INADDR_ANY;
-    }
-
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        s_listen_fd = -1;
+    if (uv_tcp_init(&s_loop, &s_server) != 0) {
+        log_error("uv_tcp_init failed");
+        uv_loop_close(&s_loop);
         return -1;
     }
+    s_server.data = NULL;
 
-    if (listen(server_fd, 16) < 0) {
-        perror("listen");
-        close(server_fd);
-        s_listen_fd = -1;
+    if (uv_async_init(&s_loop, &s_stop_async, on_stop_async) != 0) {
+        log_error("uv_async_init failed");
+        uv_loop_close(&s_loop);
         return -1;
     }
+    s_stop_async.data = NULL;
+    s_loop_ready = 1;
 
-    while (s_running && *s_running) {
-        if (select_wait(server_fd, 0, HTTP_SELECT_MS) <= 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (s_running && !*s_running) {
-                break;
-            }
-            continue;
-        }
-
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (s_running && !*s_running) {
-                break;
-            }
-            perror("accept");
-            break;
-        }
-        configure_client_socket(client_fd);
-        handle_client(client_fd);
+    struct sockaddr_in addr;
+    if (uv_ip4_addr(host, port, &addr) != 0) {
+        uv_ip4_addr("0.0.0.0", port, &addr);
     }
 
-    if (s_listen_fd >= 0) {
-        close(s_listen_fd);
-        s_listen_fd = -1;
+    int rc = uv_tcp_bind(&s_server, (const struct sockaddr *)&addr, 0);
+    if (rc != 0) {
+        log_error("bind %s:%u: %s", host, port, uv_strerror(rc));
+        goto fail;
     }
+
+    rc = uv_listen((uv_stream_t *)&s_server, HTTP_LISTEN_BACKLOG, on_connection);
+    if (rc != 0) {
+        log_error("listen: %s", uv_strerror(rc));
+        goto fail;
+    }
+
+    /* A signal may have arrived before the async handle existed. */
+    if (s_running && !*s_running) {
+        uv_walk(&s_loop, close_walk_cb, NULL);
+    }
+
+    uv_run(&s_loop, UV_RUN_DEFAULT);
+
+    uv_walk(&s_loop, close_walk_cb, NULL);
+    uv_run(&s_loop, UV_RUN_DEFAULT);
+    s_loop_ready = 0;
+    uv_loop_close(&s_loop);
     return 0;
+
+fail:
+    s_loop_ready = 0;
+    uv_close((uv_handle_t *)&s_server, NULL);
+    uv_close((uv_handle_t *)&s_stop_async, NULL);
+    uv_run(&s_loop, UV_RUN_DEFAULT);
+    uv_loop_close(&s_loop);
+    return -1;
 }

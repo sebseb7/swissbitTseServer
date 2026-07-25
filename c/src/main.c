@@ -32,9 +32,33 @@ static void on_signal(int sig) {
     http_shutdown();
 }
 
+/*
+ * Requests are handled on the libuv thread pool, so its size is the number of
+ * requests that can be in flight at once. libuv's default of 4 is low for a
+ * server whose handlers block on the TSE; it reads the variable when the pool
+ * is first used, so this must happen before the event loop starts.
+ */
+static void configure_worker_threads(void) {
+    if (getenv("UV_THREADPOOL_SIZE")) {
+        return;
+    }
+    const char *v = getenv("CLOUDTSE_WORKER_THREADS");
+    int n = v ? atoi(v) : 16;
+    if (n < 4) {
+        n = 4;
+    }
+    if (n > 128) {
+        n = 128;
+    }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", n);
+    setenv("UV_THREADPOOL_SIZE", buf, 1);
+}
+
 int main(void) {
 
     setvbuf(stdout, NULL, _IONBF, 0);
+    configure_worker_threads();
 
     /*
      * log.c (vendored in src/log.c) writes to stdout above and fflushes

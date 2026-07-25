@@ -4,6 +4,7 @@
 #include "store.h"
 #include "util.h"
 
+#include <pthread.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,24 @@
 #include <time.h>
 
 sqlite3 *g_db = NULL;
+
+static pthread_mutex_t g_db_mu;
+
+static void db_mutex_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_db_mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+void db_lock(void) {
+    pthread_mutex_lock(&g_db_mu);
+}
+
+void db_unlock(void) {
+    pthread_mutex_unlock(&g_db_mu);
+}
 
 static int ensure_parent_dir(const char *path) {
     char buf[512];
@@ -37,10 +56,13 @@ int db_open(const char *path) {
         log_error("Failed to create database directory for %s", path);
         return -1;
     }
-    if (sqlite3_open(path, &g_db) != SQLITE_OK) {
+    db_mutex_init();
+    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
+    if (sqlite3_open_v2(path, &g_db, flags, NULL) != SQLITE_OK) {
         log_error("sqlite3_open: %s", sqlite3_errmsg(g_db));
         return -1;
     }
+    sqlite3_busy_timeout(g_db, 5000);
     sqlite3_exec(g_db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
     sqlite3_exec(g_db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
     return 0;
@@ -125,7 +147,9 @@ int db_init_schema(void) {
 char *db_get_setting(const char *key, char *buf, size_t buflen) {
     const char *sql = "SELECT value FROM settings WHERE key = ?;";
     sqlite3_stmt *stmt = NULL;
+    db_lock();
     if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        db_unlock();
         return NULL;
     }
     sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
@@ -139,6 +163,7 @@ char *db_get_setting(const char *key, char *buf, size_t buflen) {
         }
     }
     sqlite3_finalize(stmt);
+    db_unlock();
     return result;
 }
 
@@ -147,25 +172,33 @@ int db_set_setting(const char *key, const char *value) {
         "INSERT INTO settings (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
     sqlite3_stmt *stmt = NULL;
+    db_lock();
     if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        db_unlock();
         return -1;
     }
     sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, value, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    db_unlock();
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int64_t db_increment_counter(const char *key) {
     char buf[64];
     int64_t current = 0;
+
+    /* Read and write must be atomic or two concurrent requests can be handed
+     * the same transaction/signature counter value. */
+    db_lock();
     if (db_get_setting(key, buf, sizeof(buf))) {
         current = atoll(buf);
     }
     int64_t next = current + 1;
     snprintf(buf, sizeof(buf), "%lld", (long long)next);
     db_set_setting(key, buf);
+    db_unlock();
     return next;
 }
 
@@ -185,7 +218,9 @@ int db_save_oauth_token(const char *token, const char *client_serial, int expire
         "INSERT OR REPLACE INTO oauth_tokens (token, client_serial, issued_at, expires_at) "
         "VALUES (?, ?, ?, ?);";
     sqlite3_stmt *stmt = NULL;
+    db_lock();
     if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        db_unlock();
         return -1;
     }
     sqlite3_bind_text(stmt, 1, token, -1, SQLITE_STATIC);
@@ -194,6 +229,7 @@ int db_save_oauth_token(const char *token, const char *client_serial, int expire
     sqlite3_bind_text(stmt, 4, expires, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    db_unlock();
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
@@ -201,7 +237,9 @@ int db_load_oauth_token(const char *token, char *client_serial, size_t serial_le
     const char *sql =
         "SELECT client_serial, issued_at, expires_at FROM oauth_tokens WHERE token = ?;";
     sqlite3_stmt *stmt = NULL;
+    db_lock();
     if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        db_unlock();
         return -1;
     }
     sqlite3_bind_text(stmt, 1, token, -1, SQLITE_STATIC);
@@ -222,6 +260,7 @@ int db_load_oauth_token(const char *token, char *client_serial, size_t serial_le
                 time_t exp_t = timegm(&tm);
                 if (exp_t < time(NULL)) {
                     sqlite3_finalize(stmt);
+                    db_unlock();
                     return -1;
                 }
             }
@@ -233,5 +272,6 @@ int db_load_oauth_token(const char *token, char *client_serial, size_t serial_le
         }
     }
     sqlite3_finalize(stmt);
+    db_unlock();
     return found ? 0 : -1;
 }

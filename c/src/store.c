@@ -151,7 +151,7 @@ void store_shutdown(void) {
     }
 }
 
-int store_register_client(const char *serial_number) {
+static int store_register_client_locked(const char *serial_number) {
     if (tse_worm_is_active()) {
         reg_client_job_t job = { .client_id = serial_number, .rc = -1 };
         tse_worker_run(reg_client_fn, &job);
@@ -227,7 +227,8 @@ static void record_transaction_finished(int64_t transaction_number) {
     sqlite3_finalize(stmt);
 }
 
-int store_list_open_transactions(tse_transaction_t *out, size_t max, size_t *out_count) {
+static int store_list_open_transactions_locked(tse_transaction_t *out, size_t max,
+                                               size_t *out_count) {
     *out_count = 0;
     const char *sql = "SELECT transaction_number, client_id, external_transaction_id, "
                       "process_type, process_data, state, time_start, time_end, "
@@ -245,9 +246,9 @@ int store_list_open_transactions(tse_transaction_t *out, size_t max, size_t *out
     return 0;
 }
 
-int store_start_transaction(const char *client_id, const char *process_type,
-                            const char *process_data, const char *external_tx_id,
-                            tse_transaction_t *out) {
+static int store_start_transaction_locked(const char *client_id, const char *process_type,
+                                          const char *process_data, const char *external_tx_id,
+                                          tse_transaction_t *out) {
     if (tse_worm_is_active()) {
         start_tx_job_t job = {
             .client_id    = client_id,
@@ -317,10 +318,11 @@ int store_start_transaction(const char *client_id, const char *process_type,
     return 0;
 }
 
-int store_finish_transaction(const char *client_id, int64_t transaction_number,
-                             const char *process_type, const char *process_data,
-                             tse_transaction_t *out, char *err_code, size_t err_code_len,
-                             char *err_msg, size_t err_msg_len) {
+static int store_finish_transaction_locked(const char *client_id, int64_t transaction_number,
+                                           const char *process_type, const char *process_data,
+                                           tse_transaction_t *out, char *err_code,
+                                           size_t err_code_len, char *err_msg,
+                                           size_t err_msg_len) {
     if (tse_worm_is_active()) {
         finish_tx_job_t job = {
             .client_id          = client_id,
@@ -407,7 +409,7 @@ int store_finish_transaction(const char *client_id, int64_t transaction_number,
     return 0;
 }
 
-void store_info(tse_info_t *info) {
+static void store_info_locked(tse_info_t *info) {
     memset(info, 0, sizeof(*info));
     if (tse_worm_is_active()) {
         fill_info_job_t job = { .info = info };
@@ -452,4 +454,54 @@ void store_info(tse_info_t *info) {
      * real values). */
     info->max_registered_clients = 100;
     info->max_started_transactions = 500;
+}
+
+/*
+ * Public entry points. Requests are served concurrently, but the TSE has a
+ * single monotonic signature counter and the sequences below read state and
+ * then write it back, so each operation runs to completion before the next
+ * one starts. The hardware itself is serialised anyway (tse_worker plus
+ * g_worm_mu), so this costs nothing in hardware mode.
+ */
+
+int store_register_client(const char *serial_number) {
+    db_lock();
+    int rc = store_register_client_locked(serial_number);
+    db_unlock();
+    return rc;
+}
+
+int store_list_open_transactions(tse_transaction_t *out, size_t max, size_t *out_count) {
+    db_lock();
+    int rc = store_list_open_transactions_locked(out, max, out_count);
+    db_unlock();
+    return rc;
+}
+
+int store_start_transaction(const char *client_id, const char *process_type,
+                            const char *process_data, const char *external_tx_id,
+                            tse_transaction_t *out) {
+    db_lock();
+    int rc = store_start_transaction_locked(client_id, process_type, process_data, external_tx_id,
+                                            out);
+    db_unlock();
+    return rc;
+}
+
+int store_finish_transaction(const char *client_id, int64_t transaction_number,
+                             const char *process_type, const char *process_data,
+                             tse_transaction_t *out, char *err_code, size_t err_code_len,
+                             char *err_msg, size_t err_msg_len) {
+    db_lock();
+    int rc = store_finish_transaction_locked(client_id, transaction_number, process_type,
+                                             process_data, out, err_code, err_code_len, err_msg,
+                                             err_msg_len);
+    db_unlock();
+    return rc;
+}
+
+void store_info(tse_info_t *info) {
+    db_lock();
+    store_info_locked(info);
+    db_unlock();
 }
