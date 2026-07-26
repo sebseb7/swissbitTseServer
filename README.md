@@ -55,9 +55,11 @@ After code changes, restart the server and **re-link** the TSE so `/tssdetails` 
 |--------|------|--------|
 | `POST` | `/oauth/token` | Basic auth `Kassen-ID:EAS-Code`, form body `grant_type=client_credentials` |
 | `GET` | `/tssdetails` | Returns **`serial`** (TSE hex) — required for link and receipt footer |
-| `GET` | `/info` | `maxNumberClients`, `maxNumberTransactions`, `currentNumberOfTransactions` |
+| `GET` | `/info` | `maxNumberClients`, `maxNumberTransactions`, `currentNumberOfTransactions` (open txs for caller) |
+| `GET` | `/transactions?clientId=` | JSON array of open txs: `transactionNumber`, `externalTransactionId`, `state` |
 | `POST` | `/transaction` | Start sale |
 | `PUT` | `/transaction/:id` | Finish sale |
+| `GET` | `/export/transactions` | Stream TSE export TAR as Base64 lines (POS concatenates → `.tar`). Hardware uses `worm_export_tar`; sim/demo builds a ustar from finished SQLite transactions |
 | `GET` | `/health` | Dev status |
 
 Receipt **TSE** line uses `/tssdetails` field `serial` (cached by the client). **POS** line uses the locally stored Kassen-ID, not the finish response.

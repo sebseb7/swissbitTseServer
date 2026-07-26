@@ -73,8 +73,10 @@ int response_finish_transaction_json(const tse_transaction_t *tx, char *out, siz
 
 int response_open_transactions_json(const tse_transaction_t *txs, size_t count, char *out,
                                     size_t outlen) {
+    /* Top-level JSON array — POS does new JSONArray(readLine()) and reads
+     * transactionNumber, externalTransactionId, state per element. */
     size_t pos = 0;
-    int n = snprintf(out + pos, outlen - pos, "{\"openTransactions\":[");
+    int n = snprintf(out + pos, outlen - pos, "[");
     if (n < 0 || (size_t)n >= outlen - pos) {
         return -1;
     }
@@ -82,28 +84,22 @@ int response_open_transactions_json(const tse_transaction_t *txs, size_t count, 
 
     for (size_t i = 0; i < count; i++) {
         const tse_transaction_t *tx = &txs[i];
-        char esc_client[512];
         char esc_ext[512];
-        char esc_ptype[1024];
-        json_escape(tx->client_id, esc_client, sizeof(esc_client));
+        char esc_state[64];
         json_escape(tx->external_transaction_id, esc_ext, sizeof(esc_ext));
-        json_escape(tx->process_type, esc_ptype, sizeof(esc_ptype));
-        char log_time[64];
-        util_fcc_log_time(tx->time_start, log_time, sizeof(log_time));
+        json_escape(tx->state[0] ? tx->state : "ACTIVE", esc_state, sizeof(esc_state));
 
         n = snprintf(out + pos, outlen - pos,
-                    "%s{\"transactionNumber\":\"%lld\",\"clientId\":\"%s\","
-                    "\"externalTransactionId\":\"%s\",\"processType\":\"%s\","
-                    "\"startTime\":\"%s\"}",
-                    i == 0 ? "" : ",", (long long)tx->transaction_number, esc_client, esc_ext,
-                    esc_ptype, log_time);
+                     "%s{\"transactionNumber\":\"%lld\",\"externalTransactionId\":\"%s\","
+                     "\"state\":\"%s\"}",
+                     i == 0 ? "" : ",", (long long)tx->transaction_number, esc_ext, esc_state);
         if (n < 0 || (size_t)n >= outlen - pos) {
             return -1;
         }
         pos += (size_t)n;
     }
 
-    n = snprintf(out + pos, outlen - pos, "],\"count\":%zu}", count);
+    n = snprintf(out + pos, outlen - pos, "]");
     if (n < 0 || (size_t)n >= outlen - pos) {
         return -1;
     }
@@ -141,13 +137,13 @@ int response_tss_details_json(const char *serial, char *out, size_t outlen) {
 }
 
 int response_info_json(int64_t registered_clients, int64_t max_registered_clients,
-                       int64_t transaction_counter, int64_t max_started_transactions, char *out,
+                       int64_t current_transactions, int64_t max_started_transactions, char *out,
                        size_t outlen) {
     return snprintf(out, outlen,
                     "{\"maxNumberClients\":\"%lld\",\"maxNumberTransactions\":\"%lld\","
                     "\"currentNumberOfTransactions\":\"%lld\",\"registeredClients\":\"%lld\"}",
                     (long long)max_registered_clients, (long long)max_started_transactions,
-                    (long long)transaction_counter, (long long)registered_clients) < (int)outlen
+                    (long long)current_transactions, (long long)registered_clients) < (int)outlen
                ? 0
                : -1;
 }

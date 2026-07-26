@@ -10,7 +10,7 @@ int response_tss_details_json(const char *serial, char *out, size_t outlen);
 int response_open_transactions_json(const tse_transaction_t *txs, size_t count, char *out,
                                     size_t outlen);
 int response_info_json(int64_t registered_clients, int64_t max_registered_clients,
-                       int64_t transaction_counter, int64_t max_started_transactions,
+                       int64_t current_transactions, int64_t max_started_transactions,
                        char *out, size_t outlen);
 int response_health_json(const tse_info_t *info, char *out, size_t outlen);
 int response_oauth_json(const char *access_token, char *out, size_t outlen);

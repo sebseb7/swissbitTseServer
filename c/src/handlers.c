@@ -78,6 +78,32 @@ static void log_request(const http_request_t *req, const char *path) {
     log_set_indent(2);
     log_query_params(req->path);
 
+    const char *auth = http_get_header(req, "Authorization");
+    if (!auth || !auth[0]) {
+        log_info("auth: (none)");
+    } else if (strncasecmp(auth, "Bearer ", 7) == 0) {
+        char token[128];
+        char client_id[256];
+        if (http_parse_bearer(req, token, sizeof(token)) == 0 &&
+            db_load_oauth_token(token, client_id, sizeof(client_id)) == 0 && client_id[0]) {
+            log_info("auth: Bearer client=%s", client_id);
+        } else {
+            log_info("auth: Bearer (invalid)");
+        }
+    } else if (strncasecmp(auth, "Basic ", 6) == 0) {
+        char client_id[256];
+        char client_secret[256];
+        if (http_parse_basic_auth(req, client_id, sizeof(client_id), client_secret,
+                                  sizeof(client_secret)) == 0 &&
+            client_id[0]) {
+            log_info("auth: Basic client=%s", client_id);
+        } else {
+            log_info("auth: Basic (invalid)");
+        }
+    } else {
+        log_info("auth: (unrecognized)");
+    }
+
     if (req->body_len == 0) {
         return;
     }
@@ -314,12 +340,22 @@ static void handle_info(http_request_t *req, http_response_t *res) {
     if (validate_bearer(req, res) != 0) {
         return;
     }
+    char client_id[256];
+    if (get_bearer_client(req, client_id, sizeof(client_id)) != 0 || !client_id[0]) {
+        char json[256];
+        response_error_json(401, "unauthorized", "Invalid or missing Bearer token", json,
+                            sizeof(json));
+        set_json_response(res, 401, json);
+        return;
+    }
     tse_info_t info;
     store_info(&info);
+    /* currentNumberOfTransactions is this client's open txs (same scope as
+     * GET /transactions), not the TSE-global startedTransactions count. */
+    int64_t open_for_client = store_count_open_transactions(client_id);
     char json[512];
-    response_info_json(info.registered_clients, info.max_registered_clients,
-                       info.transaction_counter, info.max_started_transactions, json,
-                       sizeof(json));
+    response_info_json(info.registered_clients, info.max_registered_clients, open_for_client,
+                       info.max_started_transactions, json, sizeof(json));
     set_json_response(res, 200, json);
 }
 
@@ -327,9 +363,21 @@ static void handle_list_transactions(http_request_t *req, http_response_t *res) 
     if (validate_bearer(req, res) != 0) {
         return;
     }
+    char client_id[256];
+    /* POS calls GET /transactions?clientId=<id>; fall back to bearer client. */
+    if (!http_query_param(req->path, "clientId", client_id, sizeof(client_id)) || !client_id[0]) {
+        if (get_bearer_client(req, client_id, sizeof(client_id)) != 0 || !client_id[0]) {
+            char json[256];
+            response_error_json(401, "unauthorized", "Invalid or missing Bearer token", json,
+                                sizeof(json));
+            set_json_response(res, 401, json);
+            return;
+        }
+    }
     tse_transaction_t txs[128];
     size_t count = 0;
-    if (store_list_open_transactions(txs, sizeof(txs) / sizeof(txs[0]), &count) != 0) {
+    if (store_list_open_transactions(client_id, txs, sizeof(txs) / sizeof(txs[0]), &count) !=
+        0) {
         char json[256];
         response_error_json(500, "internal_error", "failed to list open transactions", json,
                             sizeof(json));
@@ -366,6 +414,7 @@ static void export_prepare_fn(void *arg) {
 typedef struct {
     int fd;
     int write_rc;
+    int sim; /* 1 = store_export_tar (demo/sim), 0 = worm_export_tar */
 } export_stream_ctx_t;
 
 static int export_tar_chunk_cb(const unsigned char *chunk, size_t len, void *ctx) {
@@ -412,19 +461,26 @@ static int export_stream_writer(int fd, void *ctx) {
     export_stream_ctx_t *e = ctx;
     e->fd = fd;
 
-    export_tar_job_t job = { .ctx = e, .rc = -1 };
-    tse_worker_run(export_tar_fn, &job);
+    int rc;
+    if (e->sim) {
+        rc = store_export_tar(export_tar_chunk_cb, e);
+    } else {
+        export_tar_job_t job = {.ctx = e, .rc = -1};
+        tse_worker_run(export_tar_fn, &job);
+        rc = job.rc;
+    }
 
-    if (job.rc != 0) {
+    if (rc != 0) {
         /*
          * Headers (200) have already been sent, so we can't change the status
          * code now. The connection will close on return; log the failure so
          * it's not silent. (tse_worm_export_prepare gates the common causes —
          * self-test / time — before we get here.)
          */
-        log_error("GET /export/transactions: worm_export_tar failed (error %d)", job.rc);
+        log_error("GET /export/transactions: export failed (error %d, %s)", rc,
+                  e->sim ? "sim" : "hardware");
     } else {
-        log_info("GET /export/transactions: export complete");
+        log_info("GET /export/transactions: export complete (%s)", e->sim ? "sim" : "hardware");
     }
     free(e);
     return 0;
@@ -434,24 +490,22 @@ static void handle_export_transactions(http_request_t *req, http_response_t *res
     if (validate_bearer(req, res) != 0) {
         return;
     }
-    if (!tse_worm_is_active()) {
-        char json[256];
-        response_error_json(503, "service_unavailable", "TSE not active", json, sizeof(json));
-        set_json_response(res, 503, json);
-        return;
+
+    int sim = !tse_worm_is_active();
+    if (!sim) {
+        /* Run export_prepare on the worker thread so it doesn't block the server. */
+        export_prep_job_t epj = {.rc = -1};
+        tse_worker_run(export_prepare_fn, &epj);
+        if (epj.rc != 0) {
+            char json[512];
+            response_error_json(503, "service_unavailable",
+                                "TSE not ready for export (self-test or time sync failed)",
+                                json, sizeof(json));
+            set_json_response(res, 503, json);
+            return;
+        }
     }
 
-    /* Run export_prepare on the worker thread so it doesn't block the server. */
-    export_prep_job_t epj = { .rc = -1 };
-    tse_worker_run(export_prepare_fn, &epj);
-    if (epj.rc != 0) {
-        char json[512];
-        response_error_json(503, "service_unavailable",
-                            "TSE not ready for export (self-test or time sync failed)",
-                            json, sizeof(json));
-        set_json_response(res, 503, json);
-        return;
-    }
     export_stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
         char json[256];
@@ -459,10 +513,12 @@ static void handle_export_transactions(http_request_t *req, http_response_t *res
         set_json_response(res, 500, json);
         return;
     }
+    ctx->sim = sim;
+    res->status = 200;
     res->stream = true;
     util_strlcpy(res->stream_content_type, "text/plain; charset=utf-8",
                  sizeof(res->stream_content_type));
-    res->stream_fn  = export_stream_writer;
+    res->stream_fn = export_stream_writer;
     res->stream_ctx = ctx;
 }
 
@@ -535,7 +591,9 @@ void handlers_route(http_request_t *req, http_response_t *res) {
         }
     }
 
-    if (!res->no_body) {
+    if (res->stream) {
+        log_response(res->status ? res->status : 200, "(streaming)");
+    } else if (!res->no_body) {
         log_response(res->status, res->body);
     } else {
         log_set_indent(0);

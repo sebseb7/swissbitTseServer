@@ -1,6 +1,7 @@
 #include "store.h"
 #include "config.h"
 #include "db.h"
+#include "json.h"
 #include "log.h"
 #include "tse_worm.h"
 #include "tse_worker.h"
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ── TSE worker job types ──────────────────────────────────────────────── */
 
@@ -227,17 +229,19 @@ static void record_transaction_finished(int64_t transaction_number) {
     sqlite3_finalize(stmt);
 }
 
-static int store_list_open_transactions_locked(tse_transaction_t *out, size_t max,
-                                               size_t *out_count) {
+static int store_list_open_transactions_locked(const char *client_id, tse_transaction_t *out,
+                                               size_t max, size_t *out_count) {
     *out_count = 0;
     const char *sql = "SELECT transaction_number, client_id, external_transaction_id, "
                       "process_type, process_data, state, time_start, time_end, "
                       "signature_counter, signature_value "
-                      "FROM transactions WHERE state = 'ACTIVE' ORDER BY transaction_number;";
+                      "FROM transactions WHERE state = 'ACTIVE' AND client_id = ? "
+                      "ORDER BY transaction_number;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         return -1;
     }
+    sqlite3_bind_text(stmt, 1, client_id ? client_id : "", -1, SQLITE_STATIC);
     while (*out_count < max && sqlite3_step(stmt) == SQLITE_ROW) {
         load_transaction_row(stmt, &out[*out_count]);
         (*out_count)++;
@@ -429,8 +433,6 @@ static void store_info_locked(tse_info_t *info) {
     store_normalize_serial(buf, info->serial_number, sizeof(info->serial_number));
     db_get_setting("signature_counter", buf, sizeof(buf));
     info->signature_counter = atoll(buf);
-    db_get_setting("transaction_counter", buf, sizeof(buf));
-    info->transaction_counter = atoll(buf);
     if (g_created_at[0]) {
         util_strlcpy(info->created_at, g_created_at, sizeof(info->created_at));
     } else {
@@ -445,6 +447,16 @@ static void store_info_locked(tse_info_t *info) {
     if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             info->registered_clients = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    /* currentNumberOfTransactions = open (ACTIVE) txs, not the lifetime
+     * transaction_counter used to allocate new numbers. Matches hardware
+     * worm_info_startedTransactions. */
+    sql = "SELECT COUNT(*) FROM transactions WHERE state = 'ACTIVE';";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            info->transaction_counter = sqlite3_column_int64(stmt, 0);
         }
         sqlite3_finalize(stmt);
     }
@@ -471,11 +483,28 @@ int store_register_client(const char *serial_number) {
     return rc;
 }
 
-int store_list_open_transactions(tse_transaction_t *out, size_t max, size_t *out_count) {
+int store_list_open_transactions(const char *client_id, tse_transaction_t *out, size_t max,
+                                 size_t *out_count) {
     db_lock();
-    int rc = store_list_open_transactions_locked(out, max, out_count);
+    int rc = store_list_open_transactions_locked(client_id, out, max, out_count);
     db_unlock();
     return rc;
+}
+
+int64_t store_count_open_transactions(const char *client_id) {
+    int64_t count = 0;
+    db_lock();
+    const char *sql = "SELECT COUNT(*) FROM transactions WHERE state = 'ACTIVE' AND client_id = ?;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, client_id ? client_id : "", -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    db_unlock();
+    return count;
 }
 
 int store_start_transaction(const char *client_id, const char *process_type,
@@ -504,4 +533,212 @@ void store_info(tse_info_t *info) {
     db_lock();
     store_info_locked(info);
     db_unlock();
+}
+
+/* ── Demo/sim ustar export ─────────────────────────────────────────────── */
+
+#define TAR_BLOCK 512
+#define TAR_CHUNK_MAX (128 * TAR_BLOCK) /* match worm_export_tar */
+
+static void tar_header(unsigned char hdr[TAR_BLOCK], const char *name, size_t size,
+                       time_t mtime) {
+    memset(hdr, 0, TAR_BLOCK);
+    snprintf((char *)hdr, 100, "%s", name);
+    snprintf((char *)hdr + 100, 8, "%07o", 0644);
+    snprintf((char *)hdr + 108, 8, "%07o", 0);
+    snprintf((char *)hdr + 116, 8, "%07o", 0);
+    snprintf((char *)hdr + 124, 12, "%011o", (unsigned)size);
+    snprintf((char *)hdr + 136, 12, "%011o", (unsigned)mtime);
+    memset(hdr + 148, ' ', 8);
+    hdr[156] = '0';
+    memcpy(hdr + 257, "ustar", 5);
+    hdr[262] = '0';
+    hdr[263] = '0';
+
+    unsigned sum = 0;
+    for (int i = 0; i < TAR_BLOCK; i++) {
+        sum += hdr[i];
+    }
+    /* 6 octal digits + NUL + space — byte 0x9a (154) must be NUL for WormAPI. */
+    snprintf((char *)hdr + 148, 8, "%06o", sum & 0777777);
+    hdr[154] = '\0';
+    hdr[155] = ' ';
+}
+
+typedef struct {
+    tse_export_cb cb;
+    void *ctx;
+    unsigned char buf[TAR_CHUNK_MAX];
+    size_t len;
+} tar_out_t;
+
+static int tar_out_flush(tar_out_t *o, int final_partial) {
+    while (o->len >= TAR_CHUNK_MAX || (final_partial && o->len > 0)) {
+        size_t n = o->len;
+        if (n > TAR_CHUNK_MAX) {
+            n = TAR_CHUNK_MAX;
+        }
+        /* Prefer full 512-byte multiples mid-stream; allow short final chunk. */
+        if (!final_partial || o->len > TAR_CHUNK_MAX) {
+            n = (n / TAR_BLOCK) * TAR_BLOCK;
+            if (n == 0) {
+                break;
+            }
+        }
+        if (o->cb(o->buf, n, o->ctx) != 0) {
+            return -1;
+        }
+        o->len -= n;
+        if (o->len > 0) {
+            memmove(o->buf, o->buf + n, o->len);
+        }
+    }
+    return 0;
+}
+
+static int tar_out_write(tar_out_t *o, const void *data, size_t len) {
+    const unsigned char *p = data;
+    while (len > 0) {
+        size_t room = TAR_CHUNK_MAX - o->len;
+        size_t n = len < room ? len : room;
+        memcpy(o->buf + o->len, p, n);
+        o->len += n;
+        p += n;
+        len -= n;
+        if (o->len == TAR_CHUNK_MAX && tar_out_flush(o, 0) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int tar_out_pad(tar_out_t *o, size_t size) {
+    size_t pad = (TAR_BLOCK - (size % TAR_BLOCK)) % TAR_BLOCK;
+    unsigned char zeros[TAR_BLOCK];
+    memset(zeros, 0, sizeof(zeros));
+    return pad ? tar_out_write(o, zeros, pad) : 0;
+}
+
+static int tar_add_file(tar_out_t *o, const char *name, const void *data, size_t size,
+                        time_t mtime) {
+    unsigned char hdr[TAR_BLOCK];
+    tar_header(hdr, name, size, mtime);
+    if (tar_out_write(o, hdr, TAR_BLOCK) != 0) {
+        return -1;
+    }
+    if (size > 0 && tar_out_write(o, data, size) != 0) {
+        return -1;
+    }
+    return tar_out_pad(o, size);
+}
+
+int store_export_tar(tse_export_cb cb, void *ctx) {
+    tar_out_t out = {.cb = cb, .ctx = ctx, .len = 0};
+    time_t now = time(NULL);
+    tse_info_t info;
+    memset(&info, 0, sizeof(info));
+    store_info(&info);
+
+    char readme[512];
+    int readme_len =
+        snprintf(readme, sizeof(readme),
+                 "cloudtse simulator export\n"
+                 "serial=%s\n"
+                 "fccVersion=%s\n"
+                 "This archive is a demo stand-in for worm_export_tar.\n"
+                 "Member names use _Sig-<n> like the Swissbit TSE store.\n",
+                 info.serial_number, info.fcc_version);
+    if (readme_len < 0) {
+        return -1;
+    }
+    if (tar_add_file(&out, "demo/README.txt", readme, (size_t)readme_len, now) != 0) {
+        return -1;
+    }
+
+    const char *sql = "SELECT transaction_number, client_id, external_transaction_id, "
+                      "process_type, process_data, state, time_start, time_end, "
+                      "signature_counter, signature_value "
+                      "FROM transactions WHERE state = 'FINISHED' "
+                      "ORDER BY signature_counter, transaction_number;";
+
+    tse_transaction_t *rows = NULL;
+    size_t count = 0;
+    size_t cap = 0;
+
+    db_lock();
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        db_unlock();
+        return -1;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count == cap) {
+            size_t ncap = cap ? cap * 2 : 64;
+            tse_transaction_t *nr = realloc(rows, ncap * sizeof(*nr));
+            if (!nr) {
+                sqlite3_finalize(stmt);
+                db_unlock();
+                free(rows);
+                return -1;
+            }
+            rows = nr;
+            cap = ncap;
+        }
+        memset(&rows[count], 0, sizeof(rows[count]));
+        load_transaction_row(stmt, &rows[count]);
+        util_strlcpy(rows[count].serial_number, info.serial_number,
+                     sizeof(rows[count].serial_number));
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    db_unlock();
+
+    int rc = 0;
+    for (size_t i = 0; i < count; i++) {
+        const tse_transaction_t *tx = &rows[i];
+        char esc_client[512], esc_ext[512], esc_ptype[1024], esc_pdata[8192], esc_sig[512];
+        json_escape(tx->client_id, esc_client, sizeof(esc_client));
+        json_escape(tx->external_transaction_id, esc_ext, sizeof(esc_ext));
+        json_escape(tx->process_type, esc_ptype, sizeof(esc_ptype));
+        json_escape(tx->process_data, esc_pdata, sizeof(esc_pdata));
+        json_escape(tx->signature_value, esc_sig, sizeof(esc_sig));
+
+        char body[12288];
+        int body_len = snprintf(
+            body, sizeof(body),
+            "{\"transactionNumber\":\"%lld\",\"signatureCounter\":\"%lld\","
+            "\"signatureValue\":\"%s\",\"clientId\":\"%s\","
+            "\"externalTransactionId\":\"%s\",\"processType\":\"%s\","
+            "\"processData\":\"%s\",\"timeStart\":\"%s\",\"timeEnd\":\"%s\","
+            "\"serialNumber\":\"%s\"}\n",
+            (long long)tx->transaction_number, (long long)tx->signature_counter, esc_sig,
+            esc_client, esc_ext, esc_ptype, esc_pdata, tx->time_start, tx->time_end,
+            tx->serial_number);
+        if (body_len < 0 || (size_t)body_len >= sizeof(body)) {
+            rc = -1;
+            break;
+        }
+
+        /* Name must contain _Sig-<decimal> (see signatureCounterOfEntry). */
+        char name[100];
+        snprintf(name, sizeof(name), "demo/LogMessage_Tx%lld_Sig-%lld.json",
+                 (long long)tx->transaction_number, (long long)tx->signature_counter);
+
+        if (tar_add_file(&out, name, body, (size_t)body_len, now) != 0) {
+            rc = -1;
+            break;
+        }
+    }
+    free(rows);
+    if (rc != 0) {
+        return rc;
+    }
+
+    /* Two zero blocks = end-of-archive (same as worm_export_tar's size+2). */
+    unsigned char zblk[TAR_BLOCK * 2];
+    memset(zblk, 0, sizeof(zblk));
+    if (tar_out_write(&out, zblk, sizeof(zblk)) != 0) {
+        return -1;
+    }
+    return tar_out_flush(&out, 1);
 }

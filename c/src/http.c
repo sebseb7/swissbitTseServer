@@ -198,6 +198,42 @@ void http_normalize_path(const char *url_path, char *out, size_t outlen) {
     }
 }
 
+int http_query_param(const char *url_path, const char *key, char *out, size_t outlen) {
+    if (out && outlen) {
+        out[0] = '\0';
+    }
+    if (!url_path || !key || !key[0] || !out || outlen == 0) {
+        return 0;
+    }
+    const char *q = strchr(url_path, '?');
+    if (!q || !q[1]) {
+        return 0;
+    }
+    size_t key_len = strlen(key);
+    const char *p = q + 1;
+    while (*p) {
+        const char *amp = strchr(p, '&');
+        size_t pair_len = amp ? (size_t)(amp - p) : strlen(p);
+        const char *eq = memchr(p, '=', pair_len);
+        size_t name_len = eq ? (size_t)(eq - p) : pair_len;
+        if (name_len == key_len && strncmp(p, key, key_len) == 0) {
+            const char *val = eq ? eq + 1 : p + name_len;
+            size_t val_len = pair_len - name_len - (eq ? 1 : 0);
+            if (val_len >= outlen) {
+                val_len = outlen - 1;
+            }
+            memcpy(out, val, val_len);
+            out[val_len] = '\0';
+            return 1;
+        }
+        if (!amp) {
+            break;
+        }
+        p = amp + 1;
+    }
+    return 0;
+}
+
 static int header_line(const char *line, http_header_t *hdr) {
     const char *colon = strchr(line, ':');
     if (!colon) {

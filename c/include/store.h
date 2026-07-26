@@ -48,6 +48,17 @@ int store_finish_transaction(const char *client_id, int64_t transaction_number,
                              tse_transaction_t *out, char *err_code, size_t err_code_len,
                              char *err_msg, size_t err_msg_len);
 void store_info(tse_info_t *info);
-int store_list_open_transactions(tse_transaction_t *out, size_t max, size_t *out_count);
+int store_list_open_transactions(const char *client_id, tse_transaction_t *out, size_t max,
+                                 size_t *out_count);
+/* Number of ACTIVE (open) transactions for client_id. */
+int64_t store_count_open_transactions(const char *client_id);
+
+/*
+ * Demo/sim TAR export. Builds a POSIX ustar of finished transactions (member
+ * names contain _Sig-<counter> like the hardware store) and invokes cb for
+ * each chunk. Callback must return 0 to continue. Returns 0 on success.
+ */
+typedef int (*tse_export_cb)(const unsigned char *chunk, size_t len, void *ctx);
+int store_export_tar(tse_export_cb cb, void *ctx);
 
 #endif

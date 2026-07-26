@@ -59,6 +59,8 @@ void http_normalize_path(const char *url_path, char *out, size_t outlen);
 int http_parse_basic_auth(const http_request_t *req, char *client_id, size_t id_len,
                           char *client_secret, size_t secret_len);
 int http_parse_bearer(const http_request_t *req, char *token, size_t token_len);
+/* Extract a query parameter from url_path (?a=b&c=d). Returns 1 if found. */
+int http_query_param(const char *url_path, const char *key, char *out, size_t outlen);
 void http_parse_body(const char *raw, size_t raw_len, const char *content_type,
                      char *json_out, size_t json_outlen);
 
