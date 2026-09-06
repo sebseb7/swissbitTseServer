@@ -53,6 +53,7 @@ typedef struct {
 extern cloudtse_config_t g_config;
 
 void config_load(void);
+void config_sync_credentials_with_db(void);
 /* 1 if allowlist is empty or client_serial is listed (comma-separated). */
 int config_is_client_allowed(const char *client_serial);
 

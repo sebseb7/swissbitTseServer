@@ -699,13 +699,15 @@ static void load_or_generate_credential(const char *db_key, const char *configur
     db_set_setting(db_key, out);
 }
 
-static void ensure_tse_provisioned(void) {
+int tse_worm_setup(bool force) {
     if (!p_worm_info_init_state || !p_worm_tse_setup || !p_worm_info_new || !p_worm_info_read) {
-        return;
+        log_error("TSE setup cannot run: WormAPI symbols not loaded or not supported");
+        return -1;
     }
     worm_handle info = p_worm_info_new(g_store);
     if (!info) {
-        return;
+        log_error("TSE setup cannot run: failed to allocate WormInformation handle");
+        return -1;
     }
     unsigned long long state = 0;
     bool have_state = false;
@@ -716,11 +718,15 @@ static void ensure_tse_provisioned(void) {
     if (p_worm_info_free) {
         p_worm_info_free(info);
     }
-    if (!have_state || state != WORM_INIT_UNINITIALIZED) {
-        return;
+    if (have_state && state != WORM_INIT_UNINITIALIZED) {
+        if (!force) {
+            log_info("TSE is already initialized (state: %llu). Skipping setup.", state);
+            return 0;
+        }
+        log_warn("TSE is already initialized (state: %llu), but setup was forced.", state);
     }
 
-    log_warn("TSE is uninitialized — running one-time provisioning via worm_tse_setup...");
+    log_warn("Running TSE provisioning via worm_tse_setup...");
 
     char admin_pin[16];
     char admin_puk[16];
@@ -754,7 +760,7 @@ static void ensure_tse_provisioned(void) {
                   "reseller and restart. Warning: 3 failed setup attempts with a wrong seed will "
                   "permanently lock the TSE.",
                   rc);
-        return;
+        return rc;
     }
 
     util_strlcpy(g_config.worm_admin_pin, admin_pin, sizeof(g_config.worm_admin_pin));
@@ -774,6 +780,11 @@ static void ensure_tse_provisioned(void) {
         (void)WORM_HW_CALL("worm_tse_runSelfTest",
                             p_worm_run_self_test(g_store, bootstrap_client));
     }
+    return 0;
+}
+
+static void ensure_tse_provisioned(void) {
+    tse_worm_setup(false);
 }
 
 /*

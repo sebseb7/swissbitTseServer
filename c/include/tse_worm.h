@@ -8,6 +8,7 @@
 bool tse_worm_is_active(void);
 int tse_worm_init(void);
 void tse_worm_shutdown(void);
+int tse_worm_setup(bool force);
 
 int tse_worm_register_client(const char *client_id);
 int tse_worm_start_transaction(const char *client_id, const char *process_type,

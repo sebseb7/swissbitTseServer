@@ -77,7 +77,7 @@ if [[ "$CLOUDTSE_TSE_MODE" != "sim" ]]; then
     # from the one-time worm_tse_setup provisioning, so keep them there
     # instead of hardcoding/regenerating them here.
     if [[ -z "${CLOUDTSE_WORM_ADMIN_PIN:-}" ]]; then
-        echo "cloudtse: warning: CLOUDTSE_WORM_ADMIN_PIN not set (expected in $ROOT/.env)" >&2
+        echo "cloudtse: info: CLOUDTSE_WORM_ADMIN_PIN not set in env (will load from database if saved)" >&2
     fi
 
     ensure_tse_mount || true

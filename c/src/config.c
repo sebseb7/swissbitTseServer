@@ -1,4 +1,5 @@
 #include "config.h"
+#include "db.h"
 #include "util.h"
 
 #include <openssl/sha.h>
@@ -248,4 +249,37 @@ int config_is_client_allowed(const char *client_serial) {
         }
     }
     return 0;
+}
+
+void config_sync_credentials_with_db(void) {
+    char stored[128];
+
+    /* Admin PIN */
+    if (g_config.worm_admin_pin[0]) {
+        db_set_setting("worm_admin_pin", g_config.worm_admin_pin);
+    } else if (db_get_setting("worm_admin_pin", stored, sizeof(stored)) && stored[0]) {
+        util_strlcpy(g_config.worm_admin_pin, stored, sizeof(g_config.worm_admin_pin));
+    }
+
+    /* Admin PUK */
+    if (g_config.worm_admin_puk[0]) {
+        db_set_setting("worm_admin_puk", g_config.worm_admin_puk);
+    } else if (db_get_setting("worm_admin_puk", stored, sizeof(stored)) && stored[0]) {
+        util_strlcpy(g_config.worm_admin_puk, stored, sizeof(g_config.worm_admin_puk));
+    }
+
+    /* TimeAdmin PIN */
+    if (g_config.worm_time_admin_pin[0]) {
+        db_set_setting("worm_time_admin_pin", g_config.worm_time_admin_pin);
+    } else if (db_get_setting("worm_time_admin_pin", stored, sizeof(stored)) && stored[0]) {
+        util_strlcpy(g_config.worm_time_admin_pin, stored, sizeof(g_config.worm_time_admin_pin));
+    }
+
+    /* Credential seed */
+    if (g_config.worm_credential_seed[0] &&
+        strcmp(g_config.worm_credential_seed, CLOUDTSE_DEFAULT_WORM_CREDENTIAL_SEED) != 0) {
+        db_set_setting("worm_credential_seed", g_config.worm_credential_seed);
+    } else if (db_get_setting("worm_credential_seed", stored, sizeof(stored)) && stored[0]) {
+        util_strlcpy(g_config.worm_credential_seed, stored, sizeof(g_config.worm_credential_seed));
+    }
 }

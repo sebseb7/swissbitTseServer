@@ -55,7 +55,28 @@ static void configure_worker_threads(void) {
     setenv("UV_THREADPOOL_SIZE", buf, 1);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    bool do_setup = false;
+    bool force_setup = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--setup") == 0 || strcmp(argv[i], "-s") == 0) {
+            do_setup = true;
+        } else if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) {
+            force_setup = true;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [OPTIONS]\n\n"
+                   "Options:\n"
+                   "  -s, --setup    Initialize/provision the TSE device and exit\n"
+                   "  -f, --force    Force setup even if the TSE is already initialized\n"
+                   "  -h, --help     Display this help message and exit\n",
+                   argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown option: %s (run with --help for usage)\n", argv[i]);
+            return 1;
+        }
+    }
 
     setvbuf(stdout, NULL, _IONBF, 0);
     configure_worker_threads();
@@ -83,6 +104,29 @@ int main(void) {
         db_close();
         return 1;
     }
+
+    config_sync_credentials_with_db();
+
+    if (do_setup) {
+        log_info("Running TSE setup mode (--setup)...");
+        if (tse_worm_init() != 0) {
+            log_error("Failed to initialize connection to TSE hardware");
+            db_close();
+            return 1;
+        }
+        int setup_rc = tse_worm_setup(force_setup);
+        config_sync_credentials_with_db();
+        tse_worm_shutdown();
+        db_close();
+        if (setup_rc == 0) {
+            log_info("TSE setup completed successfully.");
+            return 0;
+        } else {
+            log_error("TSE setup failed with error %d.", setup_rc);
+            return 1;
+        }
+    }
+
     store_init();
     tse_worker_init();
 
