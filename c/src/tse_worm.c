@@ -99,6 +99,14 @@ typedef int (*worm_tse_run_self_test_fn)(worm_handle store, const char *client_i
 typedef int (*worm_tse_update_time_fn)(worm_handle store, unsigned long long unix_time);
 typedef int (*worm_user_login_fn)(worm_handle store, int user_id, const char *pin);
 typedef int (*worm_user_logout_fn)(worm_handle store, int user_id);
+typedef int (*worm_user_unblock_fn)(worm_handle store, unsigned char user_id,
+                                    const char *puk, unsigned int puk_len,
+                                    const char *new_pin, unsigned int new_pin_len,
+                                    unsigned int *remaining_retries);
+typedef int (*worm_user_change_pin_fn)(worm_handle store, unsigned char user_id,
+                                       const char *old_pin, unsigned int old_pin_len,
+                                       const char *new_pin, unsigned int new_pin_len,
+                                       unsigned int *remaining_retries);
 typedef const unsigned char *(*worm_info_bytes_fn)(worm_handle info, int *size);
 typedef void (*worm_info_bytes_out_fn)(worm_handle info, unsigned char **out, unsigned int *len);
 typedef void (*worm_tx_resp_sig_legacy_fn)(worm_handle response, unsigned char **out_ptr,
@@ -246,6 +254,8 @@ static worm_tse_run_self_test_fn p_worm_run_self_test;
 static worm_tse_update_time_fn p_worm_update_time;
 static worm_user_login_fn p_worm_user_login;
 static worm_user_logout_fn p_worm_user_logout;
+static worm_user_unblock_fn p_worm_user_unblock;
+static worm_user_change_pin_fn p_worm_user_change_pin;
 static worm_info_bytes_fn p_worm_info_serial;
 static worm_info_bytes_fn p_worm_info_pubkey;
 static worm_info_bytes_out_fn p_worm_info_serial_out;
@@ -903,9 +913,62 @@ static bool perform_time_sync(void) {
                      "self-test (not a PIN problem)",
                      name ? name : "?", login_rc);
         } else if (login_rc == WORM_ERROR_AUTHENTICATION_PIN_BLOCKED) {
-            log_warn("TimeAdmin login failed (AUTHENTICATION_PIN_BLOCKED / %d) — TimeAdmin PIN "
-                     "is locked. Unblock with the TimeAdmin PUK; do not keep retrying login.",
-                     login_rc);
+            if (p_worm_user_unblock && g_config.worm_admin_puk[0]) {
+                log_warn("TimeAdmin PIN is blocked — attempting automatic unblock with Admin PUK");
+                unsigned int remaining = 0;
+                int unblock_rc = (int)WORM_HW_CALL("worm_user_unblock",
+                    p_worm_user_unblock(g_store, (unsigned char)WORM_USER_TIME_ADMIN,
+                                        g_config.worm_admin_puk,
+                                        (unsigned int)strlen(g_config.worm_admin_puk),
+                                        g_config.worm_time_admin_pin,
+                                        (unsigned int)strlen(g_config.worm_time_admin_pin),
+                                        &remaining));
+                if (unblock_rc == WORM_ERROR_TSE_INVALID_PARAMETER) {
+                    /* Swissbit TSE requires the new PIN to differ from the currently blocked PIN.
+                     * Unblock with an alternate PIN first, then change back to the configured PIN. */
+                    char alt_pin[16];
+                    snprintf(alt_pin, sizeof(alt_pin), "%s", g_config.worm_time_admin_pin);
+                    size_t len = strlen(alt_pin);
+                    if (len > 0) {
+                        alt_pin[len - 1] = (alt_pin[len - 1] == '9') ? '0' : (alt_pin[len - 1] + 1);
+                    }
+                    unblock_rc = (int)WORM_HW_CALL("worm_user_unblock",
+                        p_worm_user_unblock(g_store, (unsigned char)WORM_USER_TIME_ADMIN,
+                                            g_config.worm_admin_puk,
+                                            (unsigned int)strlen(g_config.worm_admin_puk),
+                                            alt_pin, (unsigned int)strlen(alt_pin),
+                                            &remaining));
+                    if (unblock_rc == WORM_ERROR_NOERROR) {
+                        if (worm_user_login_call(WORM_USER_TIME_ADMIN, alt_pin) == WORM_ERROR_NOERROR) {
+                            if (p_worm_user_change_pin) {
+                                (void)WORM_HW_CALL("worm_user_change_pin",
+                                    p_worm_user_change_pin(g_store, (unsigned char)WORM_USER_TIME_ADMIN,
+                                                           alt_pin, (unsigned int)strlen(alt_pin),
+                                                           g_config.worm_time_admin_pin, (unsigned int)strlen(g_config.worm_time_admin_pin),
+                                                           &remaining));
+                            }
+                            worm_user_logout_call(WORM_USER_TIME_ADMIN);
+                        }
+                    }
+                }
+                if (unblock_rc == WORM_ERROR_NOERROR) {
+                    log_info("TimeAdmin PIN unblocked successfully — retrying login");
+                    login_rc = worm_user_login_call(WORM_USER_TIME_ADMIN,
+                                                    g_config.worm_time_admin_pin);
+                    if (login_rc == WORM_ERROR_NOERROR) {
+                        goto time_admin_logged_in;
+                    }
+                    log_warn("TimeAdmin login after unblock failed (error %d)", login_rc);
+                } else {
+                    log_warn("worm_user_unblock(TimeAdmin) failed (error %d, remaining PUK "
+                             "retries: %u) — check CLOUDTSE_WORM_ADMIN_PUK",
+                             unblock_rc, remaining);
+                }
+            } else {
+                log_warn("TimeAdmin login failed (AUTHENTICATION_PIN_BLOCKED / %d) — TimeAdmin "
+                         "PIN is locked. Set CLOUDTSE_WORM_ADMIN_PUK and restart to auto-unblock.",
+                         login_rc);
+            }
         } else if (login_rc == WORM_ERROR_AUTHENTICATION_FAILED) {
             log_warn("TimeAdmin login failed (AUTHENTICATION_FAILED / %d) — check "
                      "CLOUDTSE_WORM_TIME_ADMIN_PIN. Note: 3 consecutive wrong PIN attempts lock "
@@ -917,6 +980,7 @@ static bool perform_time_sync(void) {
         }
         return false;
     }
+time_admin_logged_in:;
     unsigned long long now = (unsigned long long)time(NULL);
     int update_rc =
         (int)WORM_HW_CALL("worm_tse_updateTime", p_worm_update_time(g_store, now));
@@ -1298,6 +1362,8 @@ int tse_worm_init(void) {
     p_worm_update_time = resolve(g_lib, "worm_tse_updateTime", "WormStore_tse_updateTime");
     p_worm_user_login = resolve(g_lib, "worm_user_login", "WormStore_user_login");
     p_worm_user_logout = resolve(g_lib, "worm_user_logout", "WormStore_user_logout");
+    p_worm_user_unblock = resolve(g_lib, "worm_user_unblock", NULL);
+    p_worm_user_change_pin = resolve(g_lib, "worm_user_change_pin", NULL);
     if (!g_legacy_api) {
         p_worm_info_serial =
             resolve(g_lib, "worm_info_tseSerialNumber", "WormInformation_tseSerialNumber");
