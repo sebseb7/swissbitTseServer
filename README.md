@@ -7,7 +7,7 @@ Development-only **BSI TR-03153 compatible cloud TSE** for POS integration testi
 **Build** (Debian/Ubuntu):
 
 ```bash
-sudo apt install build-essential libsqlite3-dev libssl-dev   # once
+sudo apt install build-essential libsqlite3-dev libssl-dev libuv1-dev   # once
 make -C c
 ```
 
@@ -16,8 +16,9 @@ make -C c
 | `build-essential` | `gcc`, `make` |
 | `libsqlite3-dev` | SQLite headers (`sqlite3.h`) |
 | `libssl-dev` | OpenSSL headers (`openssl/sha.h`) and `libcrypto` |
+| `libuv1-dev` | libuv event loop headers (`uv.h`) and `libuv` |
 
-On other distros, install the equivalent `-dev` packages for SQLite 3 and OpenSSL.
+On other distros, install the equivalent `-dev` packages for SQLite 3, OpenSSL, and libuv.
 
 **Simulator** (no hardware — default when running the binary directly):
 
